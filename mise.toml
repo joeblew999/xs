@@ -1,0 +1,98 @@
+# mise.toml -- task runner and tool pins for xs
+#
+# Fork of https://github.com/cablehead/xs (upstream remote: `upstream`).
+# This fork lives at https://github.com/joeblew999/xs (origin).
+#
+# Install: https://mise.jdx.dev
+# Usage:   mise install   (installs all tools at pinned versions)
+#          mise tasks     (list available tasks)
+#          mise run <task>
+#
+# Rust + wasm targets handled by rust-toolchain.toml -- mise respects it
+# automatically. Do NOT add `rust` to [tools] (single source of truth lives in
+# rust-toolchain.toml; rustup reads it locally and in CI).
+#
+# Tools previously installed via `cargo install <foo>` (which land in ~/.cargo/bin)
+# should be moved into [tools] below as `"cargo:<foo>" = "<version>"` so mise
+# manages them under ~/.local/share/mise/ and ~/.cargo/bin can stay clean.
+
+# -- Tools --------------------------------------------------------------------
+
+[tools]
+# Rust intentionally not listed here -- pinned in rust-toolchain.toml.
+node = "22"     # required for docs site (Astro)
+gh   = "latest" # GitHub CLI -- releases, PRs
+
+# -- Build --------------------------------------------------------------------
+
+[tasks.build]
+description = "Build the xs binary (debug)"
+run = "cargo build"
+
+[tasks."build:release"]
+description = "Build the xs binary (release)"
+run = "cargo build --release"
+
+# -- Run ----------------------------------------------------------------------
+
+[tasks.run]
+description = "Run the xs binary"
+run = "cargo run --"
+
+# -- Test ---------------------------------------------------------------------
+
+[tasks.test]
+description = "Run all tests"
+run = "cargo test"
+
+# -- Lint and format ----------------------------------------------------------
+
+[tasks.fmt]
+description = "Apply rustfmt to the workspace"
+run = "cargo fmt --all"
+
+[tasks."fmt:check"]
+description = "Check rustfmt without making changes"
+run = "cargo fmt --all -- --check"
+
+[tasks.clippy]
+description = "Run clippy with warnings as errors"
+run = "cargo clippy -- -D warnings"
+
+# -- Check (mirrors scripts/check.sh) -----------------------------------------
+
+[tasks.check]
+description = "Full pre-commit check: fmt + clippy + tests + docs build"
+depends = ["docs:install"]
+run = "bash scripts/check.sh"
+
+# -- Docs site (Astro under docs/) --------------------------------------------
+
+[tasks."docs:install"]
+description = "Install docs site dependencies"
+dir = "{{config_root}}/docs"
+run = "npm install"
+
+[tasks."docs:dev"]
+description = "Start the docs site dev server"
+depends = ["docs:install"]
+dir = "{{config_root}}/docs"
+run = "npm run dev"
+
+[tasks."docs:build"]
+description = "Build the docs site"
+depends = ["docs:install"]
+dir = "{{config_root}}/docs"
+run = "npm run build"
+
+[tasks."docs:check"]
+description = "Run astro check on the docs site"
+depends = ["docs:install"]
+dir = "{{config_root}}/docs"
+run = "npx astro check"
+
+# -- Clean --------------------------------------------------------------------
+
+[tasks.clean]
+description = "Clean cargo build artifacts"
+run = "cargo clean"

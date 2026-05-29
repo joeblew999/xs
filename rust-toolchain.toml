@@ -1,0 +1,13 @@
+# Pinned Rust toolchain. Source of truth for the Rust version used by xs.
+#
+# Respected by:
+#   - rustup (standard mechanism)
+#   - mise   (mise's rust plugin uses rustup as its backend, so this is picked
+#             up automatically; do not duplicate the version in mise.toml)
+#
+# Channel matches Cargo.toml's rust-version (MSRV).
+
+[toolchain]
+channel = "1.92.0"
+components = ["rustfmt", "clippy"]
+profile = "minimal"
