@@ -1,3 +1,5 @@
+> **joeblew999 fork.** Companion repos: **[http-nu](https://github.com/joeblew999/http-nu)** (the Nushell-scriptable HTTP server it powers) and **[workers-rs-util](https://github.com/joeblew999/workers-rs-util)** (`cloudflare-shell` FS plus nushell plugins).
+
 <!-- LOGO -->
 <h1>
 <p align="center">
