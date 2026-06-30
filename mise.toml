@@ -15,13 +15,35 @@
 # Tools previously installed via `cargo install <foo>` (which land in ~/.cargo/bin)
 # should be moved into [tools] below as `"cargo:<foo>" = "<version>"` so mise
 # manages them under ~/.local/share/mise/ and ~/.cargo/bin can stay clean.
+#
+# This repo consumes joeblew999/.github by reference (mise task includes + the
+# reusable CI workflow). See https://github.com/joeblew999/.github/blob/main/AGENTS.md
+
+# -- Shared task includes (joeblew999/.github) --------------------------------
+
+[task_config]
+includes = [
+  "git::https://github.com/joeblew999/.github.git//tasks/mise.toml?ref=v0.56.0",
+  "git::https://github.com/joeblew999/.github.git//tasks/ci.toml?ref=v0.56.0",
+]
 
 # -- Tools --------------------------------------------------------------------
 
 [tools]
 # Rust intentionally not listed here -- pinned in rust-toolchain.toml.
-node = "22"     # required for docs site (Astro)
-gh   = "latest" # GitHub CLI -- releases, PRs
+# Global tools (gh, fnox, jq, usage, git-cliff, nushell) come from
+# `mise run mise:global:bootstrap` -- do NOT pin them here.
+node = "22"                          # required for docs site (Astro)
+"github:nushell/nushell" = "0.113"   # per-repo pin matching the embedded nu engine (0.113.1)
+
+# -- CI knobs (read by mise:repo:bootstrap, projected into .github/workflows) --
+# NOTE: this repo already ships binaries via the hand-written
+# .github/workflows/mise-release.yml, so CI_RELEASE is intentionally NOT set --
+# `mise run mise:repo:bootstrap` (without --release) writes only mise.yml +
+# mise-upgrade.yml and leaves the release workflow untouched.
+
+[env]
+CI_OS_MATRIX = '["ubuntu-latest", "macos-latest", "windows-latest"]'   # which OSes CI runs
 
 # -- Build --------------------------------------------------------------------
 
@@ -39,11 +61,31 @@ run = "cargo build --release"
 description = "Run the xs binary"
 run = "cargo run --"
 
+# -- CI -----------------------------------------------------------------------
+# Extend the shared `ci` umbrella (ci:check-global + ci:check-nu from the
+# included tasks/ci.toml) with this repo's real build+test. mise MERGES the
+# local depends with the shared ones, so the guards still run. `test` runs
+# `cargo test`, which compiles the binary for THIS OS -- so the matrix builds
+# linux + macOS + windows. Native-safe on every runner.
+
+[tasks.ci]
+depends = ["fmt:check", "clippy", "test", "test:nu"]
+
 # -- Test ---------------------------------------------------------------------
 
 [tasks.test]
 description = "Run all tests"
 run = "cargo test"
+
+[tasks."test:nu"]
+description = "Run the xs.nu overlay integration test (builds xs, puts it on PATH, runs the nu suite)"
+depends = ["build"]
+run = '''
+#!/usr/bin/env nu
+# Prepend the freshly-built binary dir so `xs` resolves for the overlay test.
+$env.PATH = ($env.PATH | prepend (pwd | path join "target" "debug"))
+nu tests/test_xs_nu.nu
+'''
 
 # -- Lint and format ----------------------------------------------------------
 
