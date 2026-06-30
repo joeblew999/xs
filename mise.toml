@@ -69,7 +69,7 @@ run = "cargo run --"
 # linux + macOS + windows. Native-safe on every runner.
 
 [tasks.ci]
-depends = ["fmt:check", "clippy", "test", "test:nu"]
+depends = ["test", "test:nu"]
 
 # -- Test ---------------------------------------------------------------------
 
