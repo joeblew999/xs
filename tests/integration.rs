@@ -11,6 +11,28 @@ use tokio::time::timeout;
 
 use xs::store::Frame;
 
+/// Wait until the supervisor's socket exists and the server actually accepts a
+/// connection. Polling a real `xs cat` (instead of a fixed sleep after the sock
+/// file appears) closes a Windows AF_UNIX race where the sock file is created
+/// before the listener accepts, which surfaced as `os error 10061`.
+async fn wait_until_ready(store_path: &std::path::Path) {
+    let start = std::time::Instant::now();
+    loop {
+        let ready = store_path.join("sock").exists()
+            && cmd!(assert_cmd::cargo::cargo_bin!("xs"), "cat", store_path)
+                .stderr_null()
+                .read()
+                .is_ok();
+        if ready {
+            return;
+        }
+        if start.elapsed() > Duration::from_secs(15) {
+            panic!("Timeout waiting for xs server to accept connections");
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
 #[tokio::test]
 async fn test_integration() {
     let temp_dir = TempDir::new().expect("Failed to create temp dir");
@@ -18,15 +40,7 @@ async fn test_integration() {
 
     let mut child = spawn_xs_supervisor(store_path).await;
 
-    let sock_path = store_path.join("sock");
-    let start = std::time::Instant::now();
-    while !sock_path.exists() {
-        if start.elapsed() > Duration::from_secs(5) {
-            panic!("Timeout waiting for sock file");
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    wait_until_ready(store_path).await;
 
     // Verify xs.start frame
     let output = cmd!(assert_cmd::cargo::cargo_bin!("xs"), "cat", store_path)
@@ -114,15 +128,7 @@ async fn test_cat_sse_format() {
 
     let mut child = spawn_xs_supervisor(store_path).await;
 
-    let sock_path = store_path.join("sock");
-    let start = std::time::Instant::now();
-    while !sock_path.exists() {
-        if start.elapsed() > Duration::from_secs(5) {
-            panic!("Timeout waiting for sock file");
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    wait_until_ready(store_path).await;
 
     // Append test data
     cmd!(
@@ -160,15 +166,7 @@ async fn test_eval_integration() {
 
     let mut child = spawn_xs_supervisor(store_path).await;
 
-    let sock_path = store_path.join("sock");
-    let start = std::time::Instant::now();
-    while !sock_path.exists() {
-        if start.elapsed() > Duration::from_secs(5) {
-            panic!("Timeout waiting for sock file");
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    wait_until_ready(store_path).await;
 
     // Test simple string expression
     let output = cmd!(
@@ -297,15 +295,7 @@ async fn test_eval_streaming_behavior() {
 
     let mut supervisor = spawn_xs_supervisor(store_path).await;
 
-    let sock_path = store_path.join("sock");
-    let start = std::time::Instant::now();
-    while !sock_path.exists() {
-        if start.elapsed() > Duration::from_secs(5) {
-            panic!("Timeout waiting for sock file");
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    wait_until_ready(store_path).await;
 
     // Pipeline that outputs "immediate" right away, then "end" after 1 second
     let script =
@@ -357,15 +347,7 @@ async fn test_eval_bytestream_behavior() {
 
     let mut supervisor = spawn_xs_supervisor(store_path).await;
 
-    let sock_path = store_path.join("sock");
-    let start = std::time::Instant::now();
-    while !sock_path.exists() {
-        if start.elapsed() > Duration::from_secs(5) {
-            panic!("Timeout waiting for sock file");
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    wait_until_ready(store_path).await;
 
     // Test that binary data passes through without JSON encoding
     // Create a temp file with binary content, then open it to get a ByteStream
@@ -407,15 +389,7 @@ async fn test_eval_cat_streaming() {
 
     let mut child = spawn_xs_supervisor(store_path).await;
 
-    let sock_path = store_path.join("sock");
-    let start = std::time::Instant::now();
-    while !sock_path.exists() {
-        if start.elapsed() > Duration::from_secs(5) {
-            panic!("Timeout waiting for sock file");
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    wait_until_ready(store_path).await;
 
     // Append initial test data
     cmd!(
@@ -466,7 +440,7 @@ async fn test_eval_cat_streaming() {
         .expect("Timeout reading initial frame")
         .expect("Failed to read initial frame");
     assert!(result > 0, "Should read initial frame");
-    let initial_frame: serde_json::Value = serde_json::from_str(&line.trim()).unwrap();
+    let initial_frame: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
     assert_eq!(initial_frame["topic"], "stream.test");
 
     // Read threshold frame (indicates caught up to real-time)
@@ -476,7 +450,7 @@ async fn test_eval_cat_streaming() {
         .expect("Timeout reading threshold")
         .expect("Failed to read threshold");
     assert!(result > 0, "Should read threshold frame");
-    let threshold_frame: serde_json::Value = serde_json::from_str(&line.trim()).unwrap();
+    let threshold_frame: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
     assert_eq!(
         threshold_frame["topic"], "xs.threshold",
         "Should receive threshold frame indicating caught up"
@@ -500,7 +474,7 @@ async fn test_eval_cat_streaming() {
         .expect("Timeout reading streamed frame")
         .expect("Failed to read streamed frame");
     assert!(result > 0, "Should read streamed frame");
-    let streamed_frame: serde_json::Value = serde_json::from_str(&line.trim()).unwrap();
+    let streamed_frame: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
     assert_eq!(streamed_frame["topic"], "stream.test");
 
     // .cat --new starts at end (skip for now - can block)
@@ -526,7 +500,7 @@ async fn test_eval_cat_streaming() {
     let frames: Vec<serde_json::Value> = output
         .lines()
         .filter(|l| !l.is_empty())
-        .map(|l| serde_json::from_str(l).expect(&format!("Failed to parse JSON: {}", l)))
+        .map(|l| serde_json::from_str(l).unwrap_or_else(|_| panic!("Failed to parse JSON: {}", l)))
         .collect();
     assert_eq!(frames.len(), 1, "Should respect --limit flag");
 
@@ -575,15 +549,7 @@ async fn test_eval_last_follow() {
 
     let mut child = spawn_xs_supervisor(store_path).await;
 
-    let sock_path = store_path.join("sock");
-    let start = std::time::Instant::now();
-    while !sock_path.exists() {
-        if start.elapsed() > Duration::from_secs(5) {
-            panic!("Timeout waiting for sock file");
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    wait_until_ready(store_path).await;
 
     // Append initial test data
     cmd!(
@@ -616,7 +582,7 @@ async fn test_eval_last_follow() {
         .expect("Timeout waiting for current last frame")
         .expect("Failed to read current last frame");
     assert!(result > 0, "Should receive current last frame");
-    let last_frame: serde_json::Value = serde_json::from_str(&line.trim()).unwrap();
+    let last_frame: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
     assert_eq!(
         last_frame["topic"], "last.test",
         "First frame from .last --follow should be the current last"
@@ -629,7 +595,7 @@ async fn test_eval_last_follow() {
         .expect("Timeout waiting for xs.threshold")
         .expect("Failed to read xs.threshold");
     assert!(result > 0, "Should receive xs.threshold");
-    let threshold_frame: serde_json::Value = serde_json::from_str(&line.trim()).unwrap();
+    let threshold_frame: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
     assert_eq!(
         threshold_frame["topic"], "xs.threshold",
         "Should receive xs.threshold marker after historical frames"
@@ -653,7 +619,7 @@ async fn test_eval_last_follow() {
         .expect("Timeout waiting for streamed frame")
         .expect("Failed to read streamed frame");
     assert!(result > 0, "Should receive streamed frame");
-    let streamed_frame: serde_json::Value = serde_json::from_str(&line.trim()).unwrap();
+    let streamed_frame: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
     assert_eq!(streamed_frame["topic"], "last.test");
 
     // Clean up
@@ -668,15 +634,7 @@ async fn test_last_wildcard_topic() {
 
     let mut child = spawn_xs_supervisor(store_path).await;
 
-    let sock_path = store_path.join("sock");
-    let start = std::time::Instant::now();
-    while !sock_path.exists() {
-        if start.elapsed() > Duration::from_secs(5) {
-            panic!("Timeout waiting for sock file");
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    wait_until_ready(store_path).await;
 
     // Append frames to multiple topics under W.*
     cmd!(
@@ -729,15 +687,8 @@ async fn test_xs_last_cli() {
 
     let mut child = spawn_xs_supervisor(store_path).await;
 
+    wait_until_ready(store_path).await;
     let sock_path = store_path.join("sock");
-    let start = std::time::Instant::now();
-    while !sock_path.exists() {
-        if start.elapsed() > Duration::from_secs(5) {
-            panic!("Timeout waiting for sock file");
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-    tokio::time::sleep(Duration::from_millis(500)).await;
 
     // Append frames to different topics
     for (topic, content) in [
@@ -977,15 +928,7 @@ async fn test_eval_ls_outputs_plain_json() {
 
     let mut child = spawn_xs_supervisor(store_path).await;
 
-    let sock_path = store_path.join("sock");
-    let start = std::time::Instant::now();
-    while !sock_path.exists() {
-        if start.elapsed() > Duration::from_secs(5) {
-            panic!("Timeout waiting for sock file");
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    wait_until_ready(store_path).await;
 
     let output = cmd!(
         assert_cmd::cargo::cargo_bin!("xs"),
@@ -1177,15 +1120,7 @@ async fn test_sqlite_commands_available() {
 
     let mut child = spawn_xs_supervisor(store_path).await;
 
-    let sock_path = store_path.join("sock");
-    let start = std::time::Instant::now();
-    while !sock_path.exists() {
-        if start.elapsed() > Duration::from_secs(5) {
-            panic!("Timeout waiting for sock file");
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    wait_until_ready(store_path).await;
 
     let db_path = temp_dir.path().join("test.db");
     // Use forward slashes for cross-platform nushell compatibility

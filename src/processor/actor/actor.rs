@@ -2,8 +2,6 @@ use std::str::FromStr;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use tracing::instrument;
-
 use serde::{Deserialize, Serialize};
 
 use tokio::io::AsyncReadExt;
@@ -14,7 +12,6 @@ use scru128::Scru128Id;
 
 use crate::error::Error;
 use crate::nu;
-use crate::nu::commands;
 use crate::nu::value_to_json;
 use crate::nu::{NuScriptConfig, ReturnOptions};
 use crate::store::{FollowOption, Frame, ReadOptions, Store};
@@ -24,7 +21,9 @@ pub struct Actor {
     pub id: Scru128Id,
     pub topic: String,
     config: ActorConfig,
-    engine_worker: Arc<EngineWorker>,
+    engine: nu::Engine,
+    closure: nu_protocol::engine::Closure,
+    initial_state: Value,
     output: Arc<Mutex<Vec<Frame>>>,
 }
 
@@ -33,6 +32,12 @@ struct ActorConfig {
     start: Start,
     pulse: Option<u64>,
     return_options: Option<ReturnOptions>,
+    /// Optional topic filter, normalized to one pattern per element. Applied
+    /// at the read level (see `configure_read_options`): frames whose topic
+    /// matches none of these patterns never reach the actor loop. Each
+    /// pattern is an exact topic, a `prefix.*` wildcard, or `*`, the same
+    /// pattern language as `ReadOptions::topic`. Absent means all frames.
+    topics: Option<Vec<String>>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -56,6 +61,35 @@ struct ActorScriptOptions {
     return_options: Option<ReturnOptions>,
     /// Initial state for the actor closure's second parameter
     initial: Option<serde_json::Value>,
+    /// Optional list of topic patterns the actor cares about. Accepts a
+    /// nushell list of strings or a single comma-separated string.
+    topics: Option<TopicsSpec>,
+}
+
+/// A topics spec from the actor script: a single string (commas allowed) or
+/// a list of strings.
+#[derive(Deserialize, Debug)]
+#[serde(untagged)]
+enum TopicsSpec {
+    One(String),
+    Many(Vec<String>),
+}
+
+impl TopicsSpec {
+    /// Normalize to one pattern per element, splitting comma-separated
+    /// strings and dropping empty elements.
+    fn into_patterns(self) -> Vec<String> {
+        let parts: Vec<String> = match self {
+            TopicsSpec::One(s) => vec![s],
+            TopicsSpec::Many(v) => v,
+        };
+        parts
+            .iter()
+            .flat_map(|s| s.split(','))
+            .map(|p| p.trim().to_string())
+            .filter(|p| !p.is_empty())
+            .collect()
+    }
 }
 
 pub(super) enum ClosureResult {
@@ -77,14 +111,13 @@ impl Actor {
         store: Store,
     ) -> Result<Self, Error> {
         let output = Arc::new(Mutex::new(Vec::new()));
-        engine.add_commands(vec![
-            Box::new(commands::cat_command::CatCommand::new(store.clone())),
-            Box::new(commands::last_command::LastCommand::new(store.clone())),
-            Box::new(commands::append_command_buffered::AppendCommand::new(
-                store.clone(),
-                output.clone(),
-            )),
-        ])?;
+        // Reads come from the prepared base; only the per-instance buffered
+        // `.append` (for atomic batch commit) is added here.
+        nu::add_write_commands(
+            &mut engine,
+            &store,
+            nu::AppendMode::Buffered(output.clone()),
+        )?;
 
         // Parse configuration using the new generic API
         let nu_script_config = nu::parse_config(&mut engine, &expression)?;
@@ -102,7 +135,7 @@ impl Actor {
         let total_positional = num_required + num_optional;
         if total_positional != 2 {
             return Err(format!(
-                "Closure must accept exactly 2 params (frame, state) -- got {total_positional}"
+                "Closure must accept exactly 2 params (frame, state), got {total_positional}"
             )
             .into());
         }
@@ -121,39 +154,53 @@ impl Actor {
             Value::nothing(span)
         };
 
-        let engine_worker = Arc::new(EngineWorker::new(
-            engine,
-            nu_script_config.run_closure,
-            initial_state,
-        ));
-
         Ok(Self {
             id,
             topic,
             config: actor_config,
-            engine_worker,
+            engine,
+            closure: nu_script_config.run_closure,
+            initial_state,
             output,
         })
     }
 
-    async fn eval_in_thread(&self, frame: &Frame) -> Result<ClosureResult, Error> {
-        self.engine_worker.eval(frame.clone()).await
+    /// Evaluate the actor closure for one frame, inline on the calling
+    /// thread. The whole actor loop runs on a dedicated OS thread (see
+    /// `run_blocking`), so there is no async->worker->oneshot handoff per
+    /// frame -- that round trip (two context switches) was the dominant
+    /// per-frame cost in backlog replay. `state` is threaded by the caller.
+    fn eval_frame(&mut self, frame: &Frame, state: &Value) -> Result<ClosureResult, Error> {
+        let frame_val = crate::nu::frame_to_value(frame, nu_protocol::Span::unknown(), false);
+        self.engine
+            .eval_closure_no_job(&self.closure, vec![frame_val, state.clone()], None)
+            .map_err(|e| {
+                let working_set = nu_protocol::engine::StateWorkingSet::new(&self.engine.state);
+                Error::from(nu_protocol::format_cli_error(None, &working_set, &*e, None))
+            })
+            .and_then(|pd| {
+                pd.into_value(nu_protocol::Span::unknown())
+                    .map_err(Error::from)
+            })
+            .and_then(interpret_closure_result)
     }
 
-    #[instrument(
-        level = "info",
-        skip(self, frame, store),
-        fields(
-            message = %format!(
-                "actor={actor_id}:{topic} frame={frame_id}:{frame_topic}",
-                actor_id = self.id, topic = self.topic, frame_id = frame.id, frame_topic = frame.topic)
-        )
-    )]
-    async fn process_frame(&mut self, frame: &Frame, store: &Store) -> Result<bool, Error> {
-        let result = self.eval_in_thread(frame).await?;
+    fn process_frame(
+        &mut self,
+        frame: &Frame,
+        store: &Store,
+        state: &mut Value,
+    ) -> Result<bool, Error> {
+        let result = self.eval_frame(frame, state)?;
 
         let (output, should_continue) = match result {
-            ClosureResult::Continue { output, .. } => (output, true),
+            ClosureResult::Continue {
+                output,
+                ref next_state,
+            } => {
+                *state = next_state.clone();
+                (output, true)
+            }
             ClosureResult::Stop { output } => (output, false),
         };
 
@@ -176,8 +223,8 @@ impl Actor {
 
                 if use_cas {
                     let hash = match value {
-                        Value::Binary { val, .. } => store.cas_insert(val).await?,
-                        _ => store.cas_insert(&value_to_json(value).to_string()).await?,
+                        Value::Binary { val, .. } => store.cas_insert_sync(val)?,
+                        _ => store.cas_insert_sync(value_to_json(value).to_string())?,
                     };
                     Some(
                         Frame::builder(topic)
@@ -209,10 +256,7 @@ impl Actor {
         // Process buffered appends and the additional frame
         let output_to_process: Vec<_> = {
             let mut output = self.output.lock().unwrap();
-            output
-                .drain(..)
-                .chain(additional_frame.into_iter())
-                .collect()
+            output.drain(..).chain(additional_frame).collect()
         };
 
         for mut output_frame in output_to_process {
@@ -237,23 +281,44 @@ impl Actor {
         Ok(should_continue)
     }
 
-    async fn serve(&mut self, store: &Store, options: ReadOptions) {
-        let mut recver = store.read(options).await;
+    /// The actor's hot loop, run on a dedicated OS thread. Pulls frames with
+    /// blocking_recv (no async runtime hop) and evaluates each inline -- the
+    /// per-frame async->worker->oneshot round trip is gone. State is threaded
+    /// here and passed by `&mut` into `process_frame`. All store ops on this
+    /// path (`append`, `cas_insert_sync`) are synchronous.
+    fn run_blocking(mut self, mut recver: mpsc::Receiver<Frame>, store: Store) {
+        // One long-lived background job, so per-frame eval can skip job churn.
+        self.engine.attach_background_job("actor");
+        let mut state = self.initial_state.clone();
 
-        while let Some(frame) = recver.recv().await {
-            // Skip registration activity that occurred before this actor was registered
-            if (frame.topic == format!("{topic}.register", topic = self.topic)
-                || frame.topic == format!("{topic}.unregister", topic = self.topic))
-                && frame.id <= self.id
-            {
+        let create_topic = format!("xs.actor.{}.create", self.topic);
+        let term_topic = format!("xs.actor.{}.term", self.topic);
+        let store = &store;
+
+        while let Some(frame) = recver.blocking_recv() {
+            // Skip lifecycle activity that occurred before this actor was registered
+            if (frame.topic == create_topic || frame.topic == term_topic) && frame.id <= self.id {
                 continue;
             }
 
-            if frame.topic == format!("{topic}.register", topic = &self.topic)
-                || frame.topic == format!("{topic}.unregister", topic = &self.topic)
-            {
+            // A newer .create wins: this actor steps aside. Emit .replaced
+            // (the successor's .active will be next).
+            if frame.topic == create_topic {
                 let _ = store.append(
-                    Frame::builder(format!("{topic}.unregistered", topic = &self.topic))
+                    Frame::builder(format!("xs.actor.{}.replaced", &self.topic))
+                        .meta(serde_json::json!({
+                            "actor_id": self.id.to_string(),
+                            "frame_id": frame.id.to_string(),
+                        }))
+                        .build(),
+                );
+                break;
+            }
+
+            // User-requested stop.
+            if frame.topic == term_topic {
+                let _ = store.append(
+                    Frame::builder(format!("xs.actor.{}.fin.term", &self.topic))
                         .meta(serde_json::json!({
                             "actor_id": self.id.to_string(),
                             "frame_id": frame.id.to_string(),
@@ -275,12 +340,12 @@ impl Actor {
                 continue;
             }
 
-            match self.process_frame(&frame, store).await {
+            match self.process_frame(&frame, store, &mut state) {
                 Ok(true) => {}
                 Ok(false) => {
-                    // Actor self-terminated
+                    // Actor self-terminated (natural completion).
                     let _ = store.append(
-                        Frame::builder(format!("{topic}.unregistered", topic = self.topic))
+                        Frame::builder(format!("xs.actor.{}.fin.ok", &self.topic))
                             .meta(serde_json::json!({
                                 "actor_id": self.id.to_string(),
                                 "frame_id": frame.id.to_string(),
@@ -290,8 +355,9 @@ impl Actor {
                     break;
                 }
                 Err(err) => {
+                    // Runtime crash.
                     let _ = store.append(
-                        Frame::builder(format!("{topic}.unregistered", topic = self.topic))
+                        Frame::builder(format!("xs.actor.{}.fin.error", &self.topic))
                             .meta(serde_json::json!({
                                 "actor_id": self.id.to_string(),
                                 "frame_id": frame.id.to_string(),
@@ -305,21 +371,16 @@ impl Actor {
         }
     }
 
-    pub async fn spawn(&self, store: Store) -> Result<(), Error> {
+    pub async fn spawn(self, store: Store) -> Result<(), Error> {
         let options = self.configure_read_options().await;
-
-        {
-            let store = store.clone();
-            let options = options.clone();
-            let mut actor = self.clone();
-
-            tokio::spawn(async move {
-                actor.serve(&store, options).await;
-            });
-        }
+        // Set up the read stream on the async runtime, then run the actor's
+        // loop on a dedicated OS thread that drains it with blocking_recv.
+        // This keeps the synchronous nushell eval off the tokio runtime
+        // without paying a per-frame thread handoff.
+        let recver = store.read(options).await;
 
         let _ = store.append(
-            Frame::builder(format!("{topic}.active", topic = &self.topic))
+            Frame::builder(format!("xs.actor.{}.active", &self.topic))
                 .meta(serde_json::json!({
                     "actor_id": self.id.to_string(),
                     "start": self.config.start,
@@ -327,14 +388,23 @@ impl Actor {
                 .build(),
         );
 
+        let store_for_loop = store.clone();
+        std::thread::Builder::new()
+            .name(format!("actor-{}", self.topic))
+            .spawn(move || {
+                self.run_blocking(recver, store_for_loop);
+            })
+            .map_err(|e| Error::from(format!("Failed to spawn actor thread: {e}")))?;
+
         Ok(())
     }
 
     pub async fn from_frame(frame: &Frame, store: &Store) -> Result<Self, Error> {
         let topic = frame
             .topic
-            .strip_suffix(".register")
-            .ok_or("Frame topic must end with .register")?;
+            .strip_prefix("xs.actor.")
+            .and_then(|rest| rest.strip_suffix(".create"))
+            .ok_or("Frame topic must be xs.actor.<name>.create")?;
 
         // Get hash and read expression
         let hash = frame.hash.as_ref().ok_or("Missing hash field")?;
@@ -349,8 +419,11 @@ impl Actor {
             .await
             .map_err(|e| format!("Failed to read expression: {e}"))?;
 
-        // Build engine from scratch with VFS modules at this point in the stream
-        let engine = crate::processor::build_engine(store, &frame.id)?;
+        // Prepared base (Plain reads); the actor's per-instance buffered
+        // `.append` is added in Actor::new. Modules as of this frame.
+        let mut engine = nu::prepared_base(store, nu::ReadMode::Plain, false)?;
+        let modules = store.nu_modules_at(&frame.id);
+        nu::load_modules(&mut engine.state, store, &modules)?;
 
         let actor = Actor::new(
             frame.id,
@@ -379,84 +452,29 @@ impl Actor {
             .map(|pulse| FollowOption::WithHeartbeat(Duration::from_millis(pulse)))
             .unwrap_or(FollowOption::On);
 
+        // Apply the actor's topic filter at the read level: non-matching
+        // frames are skipped inside the store and never reach the actor
+        // loop. The actor's own lifecycle topics are always included so the
+        // loop still sees .create/.term frames; synthetic frames (the
+        // heartbeat xs.pulse when `pulse` is set, and xs.threshold) bypass
+        // read-level topic filtering entirely, so they are unaffected.
+        let topic = self.config.topics.as_ref().map(|patterns| {
+            let mut patterns = patterns.clone();
+            patterns.push(format!("xs.actor.{}.create", self.topic));
+            patterns.push(format!("xs.actor.{}.term", self.topic));
+            patterns.join(",")
+        });
+
         ReadOptions::builder()
             .follow(follow_option)
             .new(is_new)
             .maybe_after(after)
+            .maybe_topic(topic)
             .build()
     }
 }
 
-use tokio::sync::{mpsc, oneshot};
-
-pub struct EngineWorker {
-    work_tx: mpsc::Sender<WorkItem>,
-}
-
-struct WorkItem {
-    frame: Frame,
-    resp_tx: oneshot::Sender<Result<ClosureResult, Error>>,
-}
-
-impl EngineWorker {
-    pub fn new(
-        engine: nu::Engine,
-        closure: nu_protocol::engine::Closure,
-        initial_state: Value,
-    ) -> Self {
-        let (work_tx, mut work_rx) = mpsc::channel(32);
-
-        std::thread::spawn(move || {
-            let mut engine = engine;
-            let mut state = initial_state;
-
-            while let Some(WorkItem { frame, resp_tx }) = work_rx.blocking_recv() {
-                let frame_val =
-                    crate::nu::frame_to_value(&frame, nu_protocol::Span::unknown(), false);
-
-                let pipeline = engine.run_closure_in_job(
-                    &closure,
-                    vec![frame_val, state.clone()],
-                    None,
-                    format!("actor {topic}", topic = frame.topic),
-                );
-
-                let result = pipeline
-                    .map_err(|e| {
-                        let working_set = nu_protocol::engine::StateWorkingSet::new(&engine.state);
-                        Error::from(nu_protocol::format_cli_error(None, &working_set, &*e, None))
-                    })
-                    .and_then(|pd| {
-                        pd.into_value(nu_protocol::Span::unknown())
-                            .map_err(Error::from)
-                    })
-                    .and_then(interpret_closure_result);
-
-                if let Ok(ClosureResult::Continue { ref next_state, .. }) = result {
-                    state = next_state.clone();
-                }
-
-                let _ = resp_tx.send(result);
-            }
-        });
-
-        Self { work_tx }
-    }
-
-    pub async fn eval(&self, frame: Frame) -> Result<ClosureResult, Error> {
-        let (resp_tx, resp_rx) = oneshot::channel();
-        let work_item = WorkItem { frame, resp_tx };
-
-        self.work_tx
-            .send(work_item)
-            .await
-            .map_err(|_| Error::from("Engine worker thread has terminated"))?;
-
-        resp_rx
-            .await
-            .map_err(|_| Error::from("Engine worker thread has terminated"))?
-    }
-}
+use tokio::sync::mpsc;
 
 fn interpret_closure_result(value: Value) -> Result<ClosureResult, Error> {
     match value {
@@ -521,6 +539,7 @@ fn extract_actor_config(
             start,
             pulse: script_options.pulse,
             return_options: script_options.return_options,
+            topics: script_options.topics.map(TopicsSpec::into_patterns),
         },
         script_options.initial,
     ))

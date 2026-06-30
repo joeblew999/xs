@@ -9,9 +9,13 @@ use nu_protocol::engine::{Job, ThreadJob};
 use nu_protocol::shell_error::generic::GenericError;
 use nu_protocol::{OutDest, PipelineData, ShellError, Span, Value};
 
+use std::sync::{Arc, Mutex};
+
+use serde_json::Value as JsonValue;
+
 use crate::error::Error;
 use crate::nu::commands;
-use crate::store::Store;
+use crate::store::{Frame, Store};
 
 #[derive(Clone)]
 pub struct Engine {
@@ -23,6 +27,7 @@ impl Engine {
         let mut engine_state = create_default_context();
         engine_state = add_shell_command_context(engine_state);
         engine_state = add_cli_context(engine_state);
+        nu_std::load_standard_library(&mut engine_state)?;
 
         let init_cwd = std::env::current_dir()?;
         gather_parent_env_vars(&mut engine_state, init_cwd.as_ref());
@@ -175,6 +180,16 @@ impl Engine {
         Ok(self)
     }
 
+    /// Set the base metadata stamped on frames this engine's `.append` writes
+    /// (`service_id`, `{action_id, frame_id}`, ...). Injected as `$env` so the
+    /// `.append` decl stays instance-independent. See `append_command`.
+    pub fn set_append_meta(&mut self, meta: &JsonValue) {
+        self.state.add_env_var(
+            crate::nu::commands::append_command::APPEND_META_ENV.to_string(),
+            Value::string(meta.to_string(), Span::unknown()),
+        );
+    }
+
     pub fn run_closure_in_job(
         &mut self,
         closure: &nu_protocol::engine::Closure,
@@ -283,6 +298,105 @@ impl Engine {
         eval_res.map(|exec_data| exec_data.body).map_err(Box::new)
     }
 
+    /// Evaluate a closure WITHOUT creating and registering a fresh
+    /// `ThreadJob` per call. `run_closure_in_job` allocates an mpsc channel,
+    /// builds a `ThreadJob`, locks `self.state.jobs` and `add_job`s it -- and
+    /// never removes it -- on every invocation. In a hot per-frame actor loop
+    /// that churn (plus the unbounded jobs-table growth) dominated the cost.
+    /// The caller is expected to have attached a single long-lived background
+    /// job to `self.state` once (see the actor `EngineWorker`); this method
+    /// just sets up the stack, injects positional args, and evaluates.
+    pub fn eval_closure_no_job(
+        &mut self,
+        closure: &nu_protocol::engine::Closure,
+        args: Vec<Value>,
+        pipeline_input: Option<PipelineData>,
+    ) -> Result<PipelineData, Box<ShellError>> {
+        let block = self.state.get_block(closure.block_id);
+        let mut stack = Stack::new();
+        let mut stack =
+            stack.push_redirection(Some(Redirection::Pipe(OutDest::PipeSeparate)), None);
+
+        let num_required = block.signature.required_positional.len();
+        let num_optional = block.signature.optional_positional.len();
+        let total_positional = num_required + num_optional;
+
+        if args.len() > total_positional {
+            return Err(Box::new(ShellError::Generic(GenericError::new(
+                format!(
+                    "Too many arguments for actor closure: got {}, closure accepts at most {total_positional}.",
+                    args.len()
+                ),
+                format!("Closure signature: {name}", name = block.signature.name),
+                block.span.unwrap_or_else(Span::unknown),
+            ))));
+        }
+
+        if args.len() < num_required {
+            return Err(Box::new(ShellError::Generic(GenericError::new(
+                format!(
+                    "Actor closure expects {num_required} required argument(s), but {} were provided.",
+                    args.len()
+                ),
+                format!("Closure signature: {name}", name = block.signature.name),
+                block.span.unwrap_or_else(Span::unknown),
+            ))));
+        }
+
+        for (i, val) in args.iter().enumerate() {
+            let param = if i < num_required {
+                &block.signature.required_positional[i]
+            } else {
+                &block.signature.optional_positional[i - num_required]
+            };
+            if let Some(var_id) = param.var_id {
+                stack.add_var(var_id, val.clone());
+            }
+        }
+
+        let optional_covered = args.len().saturating_sub(num_required);
+        for i in optional_covered..num_optional {
+            let param = &block.signature.optional_positional[i];
+            if let Some(var_id) = param.var_id {
+                let default = param
+                    .default_value
+                    .clone()
+                    .unwrap_or_else(|| Value::nothing(Span::unknown()));
+                stack.add_var(var_id, default);
+            }
+        }
+
+        let eval_pipeline_input = pipeline_input.unwrap_or_else(PipelineData::empty);
+        let eval_res = nu_engine::eval_block_with_early_return::<WithoutDebug>(
+            &self.state,
+            &mut stack,
+            block,
+            eval_pipeline_input,
+        );
+
+        if eval_res.is_ok() {
+            if let Err(e) = self.state.merge_env(&mut stack) {
+                tracing::error!("Failed to merge environment from actor closure: {}", e);
+            }
+        }
+
+        eval_res.map(|exec_data| exec_data.body).map_err(Box::new)
+    }
+
+    /// Attach a single long-lived background `ThreadJob` to this engine's
+    /// state. Call once before a hot eval loop so `eval_closure_no_job` can
+    /// skip per-call job creation. Signals still propagate (the job shares
+    /// `self.state.signals()`).
+    pub fn attach_background_job(&mut self, name: impl Into<String>) {
+        let (sender, _rx) = std::sync::mpsc::channel();
+        let job = ThreadJob::new(self.state.signals().clone(), Some(name.into()), sender);
+        {
+            let mut j = self.state.jobs.lock().unwrap();
+            j.add_job(Job::Thread(job.clone()));
+        }
+        self.state.current_job.background_thread_job = Some(job);
+    }
+
     /// Kill the background ThreadJob whose name equals `name`.
     pub fn kill_job_by_name(&self, name: &str) {
         if let Ok(mut jobs) = self.state.jobs.lock() {
@@ -307,4 +421,87 @@ pub fn add_core_commands(engine: &mut Engine, store: &Store) -> Result<(), Error
         Box::new(commands::remove_command::RemoveCommand::new(store.clone())),
         Box::new(commands::scru128_command::Scru128Command::new()),
     ])
+}
+
+/// Which `.cat`/`.last` flavor a pipeline runner exposes.
+pub enum ReadMode {
+    /// Streaming readers that support `--follow` (eval, actions, services).
+    Stream,
+    /// Collected readers without follow (actors).
+    Plain,
+}
+
+/// How `.append` behaves. This is the one store command whose behaviour
+/// genuinely varies by runner.
+pub enum AppendMode {
+    /// Write straight to the store. The per-instance base metadata is injected
+    /// via the `XS_APPEND_META` env var (see `append_command`), not baked in.
+    Direct,
+    /// Buffer appended frames into `output` for the caller to flush (actors).
+    Buffered(Arc<Mutex<Vec<Frame>>>),
+}
+
+/// Register the `.cat` and `.last` read builtins for a pipeline runner.
+pub fn add_read_commands(engine: &mut Engine, store: &Store, mode: ReadMode) -> Result<(), Error> {
+    match mode {
+        ReadMode::Stream => engine.add_commands(vec![
+            Box::new(commands::cat_stream_command::CatStreamCommand::new(
+                store.clone(),
+            )),
+            Box::new(commands::last_stream_command::LastStreamCommand::new(
+                store.clone(),
+            )),
+        ]),
+        ReadMode::Plain => engine.add_commands(vec![
+            Box::new(commands::cat_command::CatCommand::new(store.clone())),
+            Box::new(commands::last_command::LastCommand::new(store.clone())),
+        ]),
+    }
+}
+
+/// Register the write builtins for a pipeline runner: `.append` (per `mode`)
+/// plus `.import` and `.cas-post`, which are identical across runners.
+pub fn add_write_commands(
+    engine: &mut Engine,
+    store: &Store,
+    mode: AppendMode,
+) -> Result<(), Error> {
+    engine.add_commands(vec![
+        Box::new(commands::import_command::ImportCommand::new(store.clone())),
+        Box::new(commands::cas_post_command::CasPostCommand::new(
+            store.clone(),
+        )),
+    ])?;
+    match mode {
+        AppendMode::Direct => engine.add_commands(vec![Box::new(
+            commands::append_command::AppendCommand::new(store.clone()),
+        )]),
+        AppendMode::Buffered(output) => engine.add_commands(vec![Box::new(
+            commands::append_command_buffered::AppendCommand::new(store.clone(), output),
+        )]),
+    }
+}
+
+/// The module-free, instance-free base engine for a runner: nushell + stdlib +
+/// the core builtins + the `.rm` alias + the read builtins, plus the `.append`
+/// write builtin for direct writers. Build this once per runner and `clone()` it per
+/// spawn or restart; `load_modules(as_of)` and `set_append_meta(..)` specialize
+/// each clone. Actors pass `direct_write: false` and add their per-instance
+/// buffered `.append` to the clone.
+pub fn prepared_base(store: &Store, read: ReadMode, direct_write: bool) -> Result<Engine, Error> {
+    // Clone the embedder's base engine when the store carries one, else build
+    // the default. See ADR 0007.
+    let mut engine = match store.base_engine() {
+        Some(base) => Engine {
+            state: base.clone(),
+        },
+        None => Engine::new()?,
+    };
+    add_core_commands(&mut engine, store)?;
+    engine.add_alias(".rm", ".remove")?;
+    add_read_commands(&mut engine, store, read)?;
+    if direct_write {
+        add_write_commands(&mut engine, store, AppendMode::Direct)?;
+    }
+    Ok(engine)
 }

@@ -49,12 +49,10 @@ mod tests {
     #[test]
     fn test_append_command() {
         let (store, mut engine) = setup_test_env();
+        engine.set_append_meta(&json!({"base": "meta"}));
         engine
             .add_commands(vec![Box::new(
-                commands::append_command::AppendCommand::new(
-                    store.clone(),
-                    json!({"base": "meta"}),
-                ),
+                commands::append_command::AppendCommand::new(store.clone()),
             )])
             .unwrap();
 
@@ -97,6 +95,39 @@ mod tests {
         assert_eq!(frame.topic, "custom-meta");
         assert_eq!(frame.meta.unwrap(), json!({"base": "meta", "foo": "bar"}));
         assert!(frame.hash.is_none());
+    }
+
+    // `.append` takes its base metadata from the `XS_APPEND_META` env var at run
+    // time, so the decl is instance-independent and a prepared engine can be
+    // cloned per runner.
+    #[test]
+    fn test_append_meta_from_env() {
+        let (store, mut engine) = setup_test_env();
+        engine
+            .add_commands(vec![Box::new(
+                commands::append_command::AppendCommand::new(store.clone()),
+            )])
+            .unwrap();
+
+        // No env, no --meta: base is an empty object.
+        let frame = value_to_frame(nu_eval(&engine, PipelineData::empty(), r#".append a"#));
+        assert_eq!(frame.meta.unwrap(), json!({}));
+
+        // Base comes from $env.XS_APPEND_META, read at run time.
+        let frame = value_to_frame(nu_eval(
+            &engine,
+            PipelineData::empty(),
+            r#"$env.XS_APPEND_META = '{"service_id": "svc"}'; .append b"#,
+        ));
+        assert_eq!(frame.meta.unwrap(), json!({"service_id": "svc"}));
+
+        // User --meta merges over the env base.
+        let frame = value_to_frame(nu_eval(
+            &engine,
+            PipelineData::empty(),
+            r#"$env.XS_APPEND_META = '{"service_id": "svc"}'; .append c --meta {k: 1}"#,
+        ));
+        assert_eq!(frame.meta.unwrap(), json!({"service_id": "svc", "k": 1}));
     }
 
     #[test]
@@ -585,5 +616,39 @@ mod tests {
         );
 
         Ok(())
+    }
+
+    // Regression test for the per-frame ThreadJob leak: run_closure_in_job
+    // registered a job in the engine's jobs table on every call and never
+    // removed it. The actor hot loop now attaches one long-lived job and
+    // evaluates frames with eval_closure_no_job; the table must not grow
+    // with call count.
+    #[test]
+    fn test_eval_closure_no_job_does_not_grow_jobs_table() {
+        let (_store, mut engine) = setup_test_env();
+        let closure = engine.parse_closure("{|x, state| $x}").unwrap();
+        engine.attach_background_job("test-actor");
+
+        let baseline = engine.state.jobs.lock().unwrap().iter().count();
+        assert_eq!(baseline, 1);
+
+        for i in 0..100 {
+            let result = engine
+                .eval_closure_no_job(
+                    &closure,
+                    vec![
+                        Value::int(i, Span::test_data()),
+                        Value::nothing(Span::test_data()),
+                    ],
+                    None,
+                )
+                .unwrap()
+                .into_value(Span::test_data())
+                .unwrap();
+            assert_eq!(result, Value::int(i, Span::test_data()));
+        }
+
+        let after = engine.state.jobs.lock().unwrap().iter().count();
+        assert_eq!(after, baseline);
     }
 }

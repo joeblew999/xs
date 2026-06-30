@@ -181,20 +181,31 @@ mod tests_store {
             .build();
         let mut recver = store.read(follow_options).await;
 
-        assert_eq!(f1, recver.recv().await.unwrap());
-        assert_eq!(f2, recver.recv().await.unwrap());
+        // Pulses are live frames and can interleave with real frames once we
+        // cross the threshold, so skip them when asserting on real frames.
+        async fn next_frame(recver: &mut tokio::sync::mpsc::Receiver<Frame>) -> Frame {
+            loop {
+                let frame = recver.recv().await.unwrap();
+                if frame.topic != "xs.pulse" {
+                    return frame;
+                }
+            }
+        }
+
+        assert_eq!(f1, next_frame(&mut recver).await);
+        assert_eq!(f2, next_frame(&mut recver).await);
 
         // crossing the threshold
         assert_eq!(
             "xs.threshold".to_string(),
-            recver.recv().await.unwrap().topic
+            next_frame(&mut recver).await.topic
         );
 
         // Append two more clips
         let f3 = store.append(Frame::builder("stream").build()).unwrap();
         let f4 = store.append(Frame::builder("stream").build()).unwrap();
-        assert_eq!(f3, recver.recv().await.unwrap());
-        assert_eq!(f4, recver.recv().await.unwrap());
+        assert_eq!(f3, next_frame(&mut recver).await);
+        assert_eq!(f4, next_frame(&mut recver).await);
 
         // Assert we see some heartbeats
         assert_eq!("xs.pulse".to_string(), recver.recv().await.unwrap().topic);
@@ -839,6 +850,67 @@ mod tests_ttl_expire {
 
         assert_eq!(frames, vec![frame3, frame4, other_frame]);
     }
+
+    /// A pruning TTL on a module topic can delete the version an earlier
+    /// processor's `.create` id resolves against. A processor reads modules as
+    /// of its own create id (`nu_modules_at`), so once the older module frame
+    /// is GC'd and the surviving one has a higher id, the module is invisible
+    /// to that processor and its `use <name>` would fail with ModuleNotFound.
+    /// Demonstrates the caution in docs/reference/ttl.mdx.
+    #[tokio::test]
+    async fn test_pruning_ttl_on_module_hides_version_from_earlier_create() {
+        let temp_dir = TempDir::new().unwrap();
+        let store = Store::new(temp_dir.keep()).unwrap();
+
+        // Module `foo` v1, registered with a pruning TTL.
+        let hash_v1 = store.cas_insert("export def v [] { 1 }").await.unwrap();
+        let mod_v1 = store
+            .append(
+                Frame::builder("xs.module.foo")
+                    .ttl(TTL::Last(1))
+                    .hash(hash_v1)
+                    .build(),
+            )
+            .unwrap();
+
+        // A processor created after v1 resolves the module as of its create id.
+        let create = store
+            .append(Frame::builder("xs.service.bar.create").build())
+            .unwrap();
+        assert!(
+            store.nu_modules_at(&create.id).contains_key("foo"),
+            "module is visible as of a create that came after v1"
+        );
+
+        // Module `foo` v2, same pruning TTL: last:1 garbage-collects v1.
+        let hash_v2 = store.cas_insert("export def v [] { 2 }").await.unwrap();
+        let _mod_v2 = store
+            .append(
+                Frame::builder("xs.module.foo")
+                    .ttl(TTL::Last(1))
+                    .hash(hash_v2)
+                    .build(),
+            )
+            .unwrap();
+        store.wait_for_gc().await;
+
+        // v1 is pruned, and v2's id is above the create id, so the processor's
+        // as-of-create read no longer sees the module at all.
+        assert_eq!(store.get(&mod_v1.id), None, "v1 was pruned by last:1");
+        assert!(
+            !store.nu_modules_at(&create.id).contains_key("foo"),
+            "the version the earlier create resolved against is gone, and v2 is in its future"
+        );
+
+        // A processor created after v2 still resolves the surviving version.
+        let create_after = store
+            .append(Frame::builder("xs.service.baz.create").build())
+            .unwrap();
+        assert!(
+            store.nu_modules_at(&create_after.id).contains_key("foo"),
+            "a create after v2 resolves the surviving version"
+        );
+    }
 }
 
 mod tests_append_race {
@@ -1013,4 +1085,197 @@ fn test_read_sync_limit_with_topic() {
         .build();
     let frames: Vec<_> = store.read_sync(options).collect();
     assert_eq!(vec![a1, a2], frames);
+}
+
+mod tests_topic_filter {
+    use super::*;
+    use tempfile::TempDir;
+
+    #[test]
+    fn test_topic_filter_parse() {
+        assert_eq!(TopicFilter::from_option(None), TopicFilter::All);
+        assert_eq!(TopicFilter::parse("*"), TopicFilter::All);
+        assert_eq!(TopicFilter::parse("a,*"), TopicFilter::All);
+        assert_eq!(
+            TopicFilter::parse("game.move.*,game.create"),
+            TopicFilter::Patterns(vec![
+                Pattern::Prefix("game.move.".to_string()),
+                Pattern::Exact("game.create".to_string()),
+            ])
+        );
+        // Empty elements are ignored
+        assert_eq!(
+            TopicFilter::parse("a,,b"),
+            TopicFilter::Patterns(vec![
+                Pattern::Exact("a".to_string()),
+                Pattern::Exact("b".to_string()),
+            ])
+        );
+        assert_eq!(TopicFilter::parse(""), TopicFilter::All);
+
+        let filter = TopicFilter::parse("game.move.*,game.create");
+        assert!(filter.matches("game.move.up"));
+        assert!(filter.matches("game.create"));
+        assert!(!filter.matches("game.move"));
+        assert!(!filter.matches("game.created"));
+        assert!(!filter.matches("other"));
+    }
+
+    #[test]
+    fn test_validate_topic_rejects_comma() {
+        // The comma list separator is safe because topic names cannot
+        // contain commas.
+        assert!(validate_topic("a,b").is_err());
+        assert!(validate_topic("game.move").is_ok());
+    }
+
+    #[test]
+    fn test_validate_topic_query_comma_list() {
+        assert!(validate_topic_query("game.move.*,game.create").is_ok());
+        assert!(validate_topic_query("*").is_ok());
+        assert!(validate_topic_query("a,").is_ok());
+        assert!(validate_topic_query("").is_err());
+        assert!(validate_topic_query(",").is_err());
+        assert!(validate_topic_query("a,1bad").is_err());
+    }
+
+    fn seed_store() -> (Store, TempDir, Vec<Frame>) {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let store = Store::new(temp_dir.path().to_path_buf()).unwrap();
+        let frames = vec![
+            store.append(Frame::builder("game.create").build()).unwrap(),
+            store.append(Frame::builder("noise").build()).unwrap(),
+            store
+                .append(Frame::builder("game.move.up").build())
+                .unwrap(),
+            store.append(Frame::builder("other.thing").build()).unwrap(),
+            store
+                .append(Frame::builder("game.move.down").build())
+                .unwrap(),
+            store.append(Frame::builder("game.create").build()).unwrap(),
+        ];
+        (store, temp_dir, frames)
+    }
+
+    #[test]
+    fn test_read_sync_multi_pattern_forward() {
+        let (store, _temp_dir, frames) = seed_store();
+
+        let options = ReadOptions::builder()
+            .topic("game.move.*,game.create".to_string())
+            .build();
+        let got: Vec<_> = store.read_sync(options).collect();
+        assert_eq!(
+            vec![
+                frames[0].clone(),
+                frames[2].clone(),
+                frames[4].clone(),
+                frames[5].clone()
+            ],
+            got
+        );
+    }
+
+    #[test]
+    fn test_read_sync_multi_pattern_last_n() {
+        let (store, _temp_dir, frames) = seed_store();
+
+        let options = ReadOptions::builder()
+            .last(3)
+            .topic("game.move.*,game.create".to_string())
+            .build();
+        let got: Vec<_> = store.read_sync(options).collect();
+        // Last 3 matching, in chronological order
+        assert_eq!(
+            vec![frames[2].clone(), frames[4].clone(), frames[5].clone()],
+            got
+        );
+    }
+
+    #[test]
+    fn test_read_sync_overlapping_patterns_dedupe() {
+        let (store, _temp_dir, frames) = seed_store();
+
+        // "game.*" and "game.move.up" both match frame 2: emitted once
+        let options = ReadOptions::builder()
+            .topic("game.*,game.move.up".to_string())
+            .build();
+        let got: Vec<_> = store.read_sync(options).collect();
+        assert_eq!(
+            vec![
+                frames[0].clone(),
+                frames[2].clone(),
+                frames[4].clone(),
+                frames[5].clone()
+            ],
+            got
+        );
+
+        // Same in the last-N (reverse) path
+        let options = ReadOptions::builder()
+            .last(4)
+            .topic("game.*,game.move.up".to_string())
+            .build();
+        let got: Vec<_> = store.read_sync(options).collect();
+        assert_eq!(
+            vec![
+                frames[0].clone(),
+                frames[2].clone(),
+                frames[4].clone(),
+                frames[5].clone()
+            ],
+            got
+        );
+    }
+
+    #[test]
+    fn test_read_sync_multi_pattern_after_and_limit() {
+        let (store, _temp_dir, frames) = seed_store();
+
+        let options = ReadOptions::builder()
+            .topic("game.move.*,game.create".to_string())
+            .after(frames[0].id)
+            .limit(2)
+            .build();
+        let got: Vec<_> = store.read_sync(options).collect();
+        assert_eq!(vec![frames[2].clone(), frames[4].clone()], got);
+    }
+
+    #[tokio::test]
+    async fn test_read_multi_pattern_historical_and_follow() {
+        let (store, _temp_dir, frames) = seed_store();
+
+        let options = ReadOptions::builder()
+            .topic("game.move.*,game.create".to_string())
+            .follow(FollowOption::On)
+            .build();
+        let mut recver = store.read(options).await;
+
+        for want in [&frames[0], &frames[2], &frames[4], &frames[5]] {
+            assert_eq!(recver.recv().await.unwrap().id, want.id);
+        }
+        // The synthetic threshold frame is delivered despite the filter
+        assert_eq!(recver.recv().await.unwrap().topic, "xs.threshold");
+
+        // Follow phase: only matching live appends come through
+        store.append(Frame::builder("noise").build()).unwrap();
+        let live = store
+            .append(Frame::builder("game.move.left").build())
+            .unwrap();
+        assert_eq!(recver.recv().await.unwrap().id, live.id);
+    }
+
+    #[tokio::test]
+    async fn test_read_multi_pattern_rev_last_n() {
+        let (store, _temp_dir, frames) = seed_store();
+
+        let options = ReadOptions::builder()
+            .last(2)
+            .topic("noise,game.create".to_string())
+            .build();
+        let mut recver = store.read(options).await;
+        assert_eq!(recver.recv().await.unwrap().id, frames[1].id);
+        assert_eq!(recver.recv().await.unwrap().id, frames[5].id);
+        assert!(recver.recv().await.is_none());
+    }
 }

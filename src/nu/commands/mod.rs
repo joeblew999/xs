@@ -1,9 +1,11 @@
 pub mod append_command;
 pub mod append_command_buffered;
 pub mod cas_command;
+pub mod cas_post_command;
 pub mod cat_command;
 pub mod cat_stream_command;
 pub mod get_command;
+pub mod import_command;
 pub mod last_command;
 pub mod last_stream_command;
 pub mod remove_command;
