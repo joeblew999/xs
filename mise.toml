@@ -19,6 +19,16 @@
 # This repo consumes joeblew999/.github by reference (mise task includes + the
 # reusable CI workflow). See https://github.com/joeblew999/.github/blob/main/AGENTS.md
 
+# -- Settings -----------------------------------------------------------------
+
+[settings]
+# Run mise tasks serially. `ci` fans out cargo invocations (build + test); on a
+# COLD cache (fresh windows runner) parallel cargo processes fight the package-
+# cache + build-directory locks and effectively deadlock. One at a time = only
+# cargo's own internal parallelism, no cross-invocation contention. Warm runs
+# hit rust-cache so this costs ~0.
+jobs = 1
+
 # -- Shared task includes (joeblew999/.github) --------------------------------
 
 [task_config]
