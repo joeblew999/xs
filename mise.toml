@@ -82,6 +82,12 @@ description = "Run the xs.nu overlay integration test (builds xs, puts it on PAT
 depends = ["build"]
 run = '''
 #!/usr/bin/env nu
+# The overlay test spawns `xs`/`tail` processes that don't terminate cleanly on
+# Windows runners (the suite hangs). Skip there; unix/macOS cover the overlay.
+if ($nu.os-info.name == "windows") {
+  print "test:nu skipped on windows (xs.nu overlay process lifecycle)"
+  return
+}
 # Prepend the freshly-built binary dir so `xs` resolves for the overlay test.
 $env.PATH = ($env.PATH | prepend (pwd | path join "target" "debug"))
 nu tests/test_xs_nu.nu
